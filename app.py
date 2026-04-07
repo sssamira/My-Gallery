@@ -1,190 +1,145 @@
+import boto3
 import os
 from datetime import datetime
 from uuid import uuid4
 
-from flask import Flask, request, jsonify, send_file, abort
-from flask_sqlalchemy import SQLAlchemy
-
+from flask import Flask, redirect, request, jsonify, send_file, abort
 
 app = Flask(__name__, static_folder=".", static_url_path="")
 
-# Database configuration
-os.makedirs(app.instance_path, exist_ok=True)
+# -----------------------------
+# AWS Configuration
+# -----------------------------
+S3_BUCKET = "amsambucket"          # your S3 bucket name
+DYNAMO_TABLE = "GalleryFiles"      # your DynamoDB table name
 
-def _default_db_url() -> str:
-    db_path = os.path.join(app.instance_path, "gallery.db")
-    return f"sqlite:///{db_path}"
+s3 = boto3.client("s3")
+dynamodb = boto3.resource("dynamodb")
+table = dynamodb.Table(DYNAMO_TABLE)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DB_URL", _default_db_url())
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
-
-db = SQLAlchemy(app)
-
-
-class Media(db.Model):  # type: ignore[name-defined]
-    __tablename__ = "media"
-
-    id = db.Column(db.Integer, primary_key=True)
-    original_filename = db.Column(db.String(255), nullable=False)
-    storage_key = db.Column(db.String(512), unique=True, nullable=False)
-    mime_type = db.Column(db.String(255), nullable=False)
-    size_bytes = db.Column(db.Integer, nullable=False)
-    kind = db.Column(db.String(32), nullable=False)  # image, video, proto
-    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
-
-    def to_dict(self) -> dict:
-        return {
-            "id": self.id,
-            "originalFilename": self.original_filename,
-            "storageKey": self.storage_key,
-            "mimeType": self.mime_type,
-            "sizeBytes": self.size_bytes,
-            "kind": self.kind,
-            "createdAt": self.created_at.isoformat() + "Z",
-            "downloadUrl": f"/api/media/{self.id}/download",
-        }
-
-
-class LocalStorageService:
-    def __init__(self, root_dir: str) -> None:
-        self.root_dir = root_dir
-        os.makedirs(self.root_dir, exist_ok=True)
-
-    def _full_path(self, storage_key: str) -> str:
-        path = os.path.join(self.root_dir, storage_key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        return path
-
-    def save_file(self, file_storage, storage_key: str) -> str:
-        path = self._full_path(storage_key)
-        file_storage.save(path)
+# -----------------------------
+# Storage Service
+# -----------------------------
+class S3StorageService:
+    def save_file(self, file_storage, storage_key):
+        """Upload file object to S3"""
+        s3.upload_fileobj(file_storage, S3_BUCKET, storage_key)
         return storage_key
 
-    def get_path(self, storage_key: str) -> str:
-        path = os.path.join(self.root_dir, storage_key)
-        if not os.path.isfile(path):
-            raise FileNotFoundError(storage_key)
-        return path
+    def get_file_url(self, storage_key):
+        """Return S3 public URL"""
+        return f"https://{S3_BUCKET}.s3.amazonaws.com/{storage_key}"
 
-    def delete_file(self, storage_key: str) -> None:
-        try:
-            path = self.get_path(storage_key)
-        except FileNotFoundError:
-            return
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+    def delete_file(self, storage_key):
+        """Delete object from S3"""
+        s3.delete_object(Bucket=S3_BUCKET, Key=storage_key)
 
+storage_service = S3StorageService()
 
-STORAGE_ROOT = os.getenv("STORAGE_ROOT", os.path.join(app.instance_path, "uploads"))
-storage_service = LocalStorageService(STORAGE_ROOT)
+# -----------------------------
+# Helper Function
+# -----------------------------
+def to_dict(item):
+    return {
+        "id": item["id"],
+        "originalFilename": item["original_filename"],
+        "storageKey": item["storage_key"],
+        "mimeType": item["mime_type"],
+        "sizeBytes": item["size_bytes"],
+        "kind": item["kind"],
+        "createdAt": item["created_at"],
+        "downloadUrl": f"/api/media/{item['id']}/download"
+    }
 
-
-with app.app_context():
-    db.create_all()
-
-
+# -----------------------------
+# Routes
+# -----------------------------
 @app.route("/")
-def index() -> object:
-    """Serve the React single-page app."""
+def index():
+    """Serve the React single-page app"""
     return send_file("index.html")
 
 
 @app.route("/api/media", methods=["GET"])
-def list_media() -> object:
-    page = max(int(request.args.get("page", 1)), 1)
-    page_size = max(min(int(request.args.get("pageSize", 24)), 100), 1)
-
-    query = Media.query.order_by(Media.created_at.desc())
-    total = query.count()
-    items = (
-        query.offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-
-    return jsonify(
-        {
-            "items": [m.to_dict() for m in items],
-            "page": page,
-            "pageSize": page_size,
-            "total": total,
-        }
-    )
+def list_media():
+    """List all media items"""
+    response = table.scan()
+    items = sorted(response.get("Items", []), key=lambda x: x["created_at"], reverse=True)
+    return jsonify({
+        "items": [to_dict(item) for item in items],
+        "total": len(items),
+        "page": 1,
+        "pageSize": len(items)
+    })
 
 
 @app.route("/api/upload", methods=["POST"])
-def upload_media() -> object:
+def upload_media():
     uploaded_file = request.files.get("file")
     kind = (request.form.get("kind") or "").lower() or "other"
 
     if uploaded_file is None or uploaded_file.filename == "":
         return jsonify({"error": "No file provided"}), 400
-
     if kind not in {"image", "video", "proto", "other"}:
         return jsonify({"error": "Invalid kind"}), 400
 
     original_filename = uploaded_file.filename
     mime_type = uploaded_file.mimetype or "application/octet-stream"
-
     ext = os.path.splitext(original_filename)[1]
     storage_key = os.path.join(kind, f"{uuid4().hex}{ext}")
 
+    # Upload to S3
     storage_service.save_file(uploaded_file, storage_key)
-    full_path = storage_service.get_path(storage_key)
-    size_bytes = os.path.getsize(full_path)
+    size_bytes = uploaded_file.content_length or 0
 
-    media = Media(
-        original_filename=original_filename,
-        storage_key=storage_key,
-        mime_type=mime_type,
-        size_bytes=size_bytes,
-        kind=kind,
-    )
-    db.session.add(media)
-    db.session.commit()
+    # Save metadata to DynamoDB
+    media_item = {
+        "id": str(uuid4()),
+        "original_filename": original_filename,
+        "storage_key": storage_key,
+        "mime_type": mime_type,
+        "size_bytes": size_bytes,
+        "kind": kind,
+        "created_at": datetime.utcnow().isoformat() + "Z"
+    }
+    table.put_item(Item=media_item)
 
-    return jsonify(media.to_dict()), 201
+    return jsonify(to_dict(media_item)), 201
 
 
-@app.route("/api/media/<int:media_id>/download", methods=["GET"])
-def download_media(media_id: int) -> object:
-    media = Media.query.get(media_id)
-    if media is None:
+@app.route("/api/media/<string:media_id>/download", methods=["GET"])
+def download_media(media_id):
+    """Redirect to S3 URL for download"""
+    response = table.get_item(Key={"id": media_id})
+    item = response.get("Item")
+    if not item:
+        abort(404)
+    return redirect(storage_service.get_file_url(item["storage_key"]))
+
+
+@app.route("/api/media/<string:media_id>", methods=["DELETE"])
+def delete_media(media_id):
+    """Delete media item"""
+    response = table.get_item(Key={"id": media_id})
+    item = response.get("Item")
+    if not item:
         abort(404)
 
-    try:
-        path = storage_service.get_path(media.storage_key)
-    except FileNotFoundError:
-        abort(404)
+    # Delete from S3
+    storage_service.delete_file(item["storage_key"])
+    # Delete from DynamoDB
+    table.delete_item(Key={"id": media_id})
 
-    return send_file(
-        path,
-        as_attachment=True,
-        download_name=media.original_filename,
-        mimetype=media.mime_type,
-    )
-
-
-@app.route("/api/media/<int:media_id>", methods=["DELETE"])
-def delete_media(media_id: int) -> object:
-    media = Media.query.get(media_id)
-    if media is None:
-        abort(404)
-
-    storage_service.delete_file(media.storage_key)
-    db.session.delete(media)
-    db.session.commit()
-
-    return ("", 204)
+    return "", 204
 
 
 @app.route("/health", methods=["GET"])
-def health() -> object:
+def health():
     return jsonify({"status": "ok"})
 
 
+# -----------------------------
+# Run App
+# -----------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
