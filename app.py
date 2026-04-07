@@ -13,9 +13,10 @@ app = Flask(__name__, static_folder=".", static_url_path="")
 S3_BUCKET = "amsambucket"          # your S3 bucket name
 DYNAMO_TABLE = "GalleryFiles"      # your DynamoDB table name
 
+
 s3 = boto3.client("s3")
-dynamodb = boto3.resource("dynamodb")
-table = dynamodb.Table(DYNAMO_TABLE)
+dynamodb = boto3.resource("dynamodb", region_name="us-east-1")
+table = dynamodb.Table("GalleryFiles")
 
 # -----------------------------
 # Storage Service
